@@ -10,6 +10,7 @@ from langchain.agents.agent_types import AgentType
 from langchain.tools import tool
 from db_connection import get_engine
 from config import GEMINI_API_KEY
+import re
 
 
 # 1️⃣ Initialize LLM
@@ -24,25 +25,33 @@ llm = ChatGoogleGenerativeAI(
 engine = get_engine()
 db = SQLDatabase(engine, include_tables=["AACountyexcel"])
 
-# 3️⃣ Schema Context (minimal version)
+# 3️⃣ Schema Context
 schema_context = """
 You are an expert assistant helping health inspectors query a Microsoft SQL Server database.
 The database contains inspection, permit, and facility information for food establishments in Anne Arundel County.
+
 Only use the table [AACountyexcel].
 All column names contain spaces and must be wrapped in [square brackets].
-Use only SELECT statements — never INSERT, UPDATE, or DELETE.
-You write SQL queries ONLY for **Microsoft SQL Server (T-SQL)**.
-Never use MySQL or PostgreSQL syntax.
+Use only SELECT statements — never INSERT, UPDATE, DELETE, or DROP.
 
-Formatting rules:
+⚠️ DATABASE TYPE: Microsoft SQL Server (T-SQL) — NOT MySQL, SQLite, or PostgreSQL. ⚠️
+
+Formatting rules (follow these EXACTLY):
 - NEVER include backticks (`) or Markdown code fences (```sql ... ```).
-- NEVER prefix or suffix queries with ``` or quotes.
-- Write the query as raw SQL text, not Markdown.
-- Always wrap column and table names in [square brackets], like [FSF NAME] or [AACountyexcel] when making sql queries. 
-- End each query with a semicolon only if needed.
-- Output ONLY the SQL code — no explanations, no commentary.
+- NEVER include triple backticks (```) anywhere in the output.
+- NEVER include quotes or escape characters around the query.
+- NEVER add “sql” or any labels before or after the query.
+- Write the query as plain text — valid raw T-SQL only.
+- Always wrap column and table names in [square brackets], e.g. [FSF NAME], [BUSINESS NAME], [AACountyexcel].
+- End the query with a semicolon if appropriate.
+- Output ONLY the SQL query — no explanations, commentary, or reasoning.
 
-Column hints for AAcountyexcel table:
+Example of correct output:
+SELECT [FSF NAME], [RISK], [INSPECTION DATE]
+FROM [AACountyexcel]
+WHERE [BUSINESS NAME] = 'Riva Food Market';
+
+Column Hints:
 [FSF#] -> Facility’s unique identifier number.
 [FSF NAME] -> Official facility name (e.g., restaurant or grocery store name).
 [FSF ADDRESS] -> Street address of the facility.
@@ -135,27 +144,31 @@ Column hints for AAcountyexcel table:
 [inserted] -> System field marking when the record was inserted.
 [itemid] -> (unknown purpose)
 [addressitem] -> Possibly linked address reference key.
-[insertednum] -> Internal insertion sequence or counter.
+[insertednum] -> Internal insertion sequence or counter. 
 """
 
-# 4️⃣ Define a summarization tool
+
+# 4️⃣ Define summarization tool
 @tool("summarize_data", return_direct=True)
 def summarize_data(data: str) -> str:
-    """Summarizes SQL query results into a human-readable response."""
+    """Summarizes SQL query results into a human-readable paragraph."""
     summary_prompt = f"""
-    You are a helpful data summarizer.
-    The following is output from a SQL query about health facilities:
+    You are a helpful assistant summarizing SQL query results about food facilities.
 
+    The following is raw output from a SQL query:
     {data}
 
-    Write a concise summary highlighting:
-    - Facility name and address
-    - Permit issue/expiry dates
-    - Risk level or facility type if present
-    - Avoid verbose explanations.
+    Write a clear, human-readable summary:
+    - Focus on FSF#, Facility Name, Business Name, Address, City, State, ZIP, Owner or Contact Name, and Phone.
+    - Exclude technical fields like TAX ID, FEES, DATES, or SEATING unless critical.
+    - Keep it short, in paragraph form, not a list.
+    - Example:
+    Riva Food Market (FSF# 0020010398) is a licensed food establishment located at 3111 Riva Road, Riva, MD 21140.
+    It operates under D & J of Riva, Inc., owned by Bryan Jackson.
+    The main contact number is 410-956-2454.
     """
     summary = llm.invoke(summary_prompt)
-    return summary.content
+    return summary.content.strip()
 
 
 # 5️⃣ Create SQL Agent
@@ -167,22 +180,40 @@ agent = create_sql_agent(
     system_message=schema_context,
 )
 
+
+# ✅ Utility to sanitize SQL output from the agent
+def clean_sql_output(text: str) -> str:
+    """Remove markdown artifacts like ```sql``` or ``` from model output."""
+    if not text:
+        return text
+    cleaned = re.sub(r"```sql|```", "", text, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
 # 6️⃣ Run and summarize manually
 def query_and_summarize(user_query: str):
-    """Runs the SQL agent, gets query output, then summarizes it."""
+    """Runs the SQL agent, cleans the query, executes safely, and summarizes results."""
     print(f"\n🚀 Running QueryBot for: {user_query}\n")
 
-    # Step 1: Ask agent to execute SQL
+    # Step 1: Ask agent for the SQL query
     query_result = agent.invoke({"input": user_query})
     raw_output = query_result.get("output", "")
 
-    # Step 2: Summarize if output looks like SQL data
-    if "SELECT" not in raw_output.upper() and len(raw_output) > 20:
-        return f"🧠 Summary:\n{raw_output}"
-    else:
-        # Agent only generated query, not data — ask summarizer
-        summary = summarize_data(raw_output)
-        return f"🧠 Summary:\n{summary}"
+    # Step 2: Clean and execute the SQL if it looks like a query
+    cleaned_query = clean_sql_output(raw_output)
+    print(f"🧹 Cleaned SQL:\n{cleaned_query}\n")
+
+    try:
+        # Only run if it's a SELECT query
+        if cleaned_query.strip().upper().startswith("SELECT"):
+            result = db.run(cleaned_query)
+            summary = summarize_data(result)
+            return f"🧠 Summary:\n{summary}"
+        else:
+            return f"⚠️ Non-SELECT output:\n{cleaned_query}"
+
+    except Exception as e:
+        return f"❌ SQL Execution Error:\n{e}\nRaw SQL:\n{cleaned_query}"
 
 
 # 7️⃣ Example usage
